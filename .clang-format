@@ -1,0 +1,13 @@
+BasedOnStyle: LLVM
+AlignAfterOpenBracket: AlwaysBreak
+BreakConstructorInitializers: AfterColon
+BinPackArguments: false  // Important for this case
+BinPackParameters: false  // Important for this case
+AlignEscapedNewlines: DontAlign
+SpacesBeforeTrailingComments: 2
+AllowShortBlocksOnASingleLine: Never
+AllowShortFunctionsOnASingleLine: None
+ContinuationIndentWidth: 2
+IndentWidth: 2
+Standard: c++17
+UseTab: Never

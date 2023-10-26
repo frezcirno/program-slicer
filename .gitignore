@@ -1,0 +1,14 @@
+joern/
+octopus-joern
+
+.vscode/
+__pycache__/
+*.py[cod]
+*.png
+*.dot
+*.pickle
+*.picklez
+*.bin
+
+redis/
+*_parsed/
