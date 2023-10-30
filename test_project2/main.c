@@ -24,8 +24,13 @@ int foo() {
     return 0;
 }
 
-int bar(int x) {
-    if (x == 10) {
+int bar(
+    int x
+) {
+    if (
+        x ==
+        10
+    ) {
         return
             foobar();
     } else {
