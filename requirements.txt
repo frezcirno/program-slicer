@@ -1,0 +1,4 @@
+igraph
+pydot
+python-Levenshtein
+tqdm

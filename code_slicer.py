@@ -10,6 +10,10 @@ import Levenshtein
 import re
 
 DIR = os.path.dirname(os.path.abspath(__file__))
+
+JOERN_PARSE_BIN = os.path.join(DIR, "octopus-joern", "joern-parse")
+MERGE_SCRIPT = os.path.join(DIR, "octopus-joern-merge.sh")
+
 SENSI_API_LIST = os.path.join(DIR, "resources", "sensiAPI.txt")
 with open(SENSI_API_LIST, "r", encoding="utf-8") as f:
     SENSI_API_SET = frozenset([api.strip() for api in f.read().split(",")])
@@ -369,10 +373,10 @@ def get_top_node_info(v: Vertex):
     }:
         line, code = get_ctrl_sig(stmt)
     elif stmt["type"] in {"DoStatement"}:
-        nextv = v.graph.vs[stmt.index + 1]
-        if nextv["type"] == "CompoundStatement":
-            # joern bug: wrong location
-            nextv = v.graph.vs[stmt.index + 2]
+        nextv = v
+        # joern bug: wrong location
+        while nextv["location"] == "":
+            nextv = v.graph.vs[nextv.index + 1]
         line = int(nextv["location"].split(":", 1)[0]) - 1
         code = stmt["code"] + " {"
     elif stmt["type"] in {"ElseStatement"}:
@@ -395,7 +399,7 @@ def get_top_node_info(v: Vertex):
 
 
 def get_functions(cpg: Graph):
-    funcs = {}
+    func_table = defaultdict(list)
     for v in cpg.vs:
         if v["type"] == "CFGEntryNode":
             fnv = find_parent_by_etype(v, "IS_FUNCTION_OF_CFG")
@@ -404,35 +408,38 @@ def get_functions(cpg: Graph):
             filev = find_file(fnv)
             if filev is None:
                 continue
-            fname = fnv["code"]
+            fnname = fnv["code"]
             filename = filev["code"]
-            funcs[(filename, fname)] = fnv.index
-    return funcs
+            func_table[fnname].append((filename, fnv.index))
+    return func_table
 
 
-def add_call_edges(cpg: Graph, funcs: dict):
-    for v in cpg.vs:
-        if v["type"] == "CallExpression":
-            calleev = v.graph.vs[v.index + 1]
-            if calleev is None:
-                continue
-            fname = calleev["code"]
-            filev = find_file(v)
-            if filev is None:
-                continue
-            filename = filev["code"]
+def add_call_edges(cpg: Graph, func_table: defaultdict[str, list[tuple[str, int]]]):
+    call_edges = []
 
-            matched_fns = [func for func in funcs if func[1] == fname]
-            if not matched_fns:
-                continue
-            if len(matched_fns) > 1:
-                # select the most similar one
-                matched_fns = sorted(
-                    matched_fns, key=lambda x: Levenshtein.distance(x[0], filename)
-                )
-            matched_fn = matched_fns[0]
+    for v in cpg.vs.select(type="CallExpression"):
+        calleev = v.graph.vs[v.index + 1]
+        if calleev is None:
+            continue
+        fnname = calleev["code"]
+        filev = find_file(v)
+        if filev is None:
+            continue
+        filename = filev["code"]
 
-            cpg.add_edge(v, funcs[matched_fn], type="CALLS")
+        if fnname not in func_table:
+            continue
+        matched_fns = func_table[fnname]
+        if len(matched_fns) > 1:
+            # select the most similar one
+            matched_fns = sorted(
+                matched_fns, key=lambda x: Levenshtein.distance(x[0], filename)
+            )
+        matched_fn = matched_fns[0]
+
+        call_edges.append((v.index, matched_fn[1]))
+
+    cpg.add_edges(call_edges, {"type": ["CALLS" for _ in range(len(call_edges))]})
 
 
 def get_statement_code(cpg: Graph, location: str, basedir: str):
@@ -448,19 +455,20 @@ def get_statement_code(cpg: Graph, location: str, basedir: str):
 
 def merge_nodes(cpg: Graph):
     edges = {}
-    for e in cpg.es:
-        if e["type"] in {"CONTROLS", "CALLS"}:
-            src_key, src_info = get_top_node_info(e.source_vertex)
-            dst_key, dst_info = get_top_node_info(e.target_vertex)
-            if not src_key or not dst_key or src_key == dst_key:
-                continue
-            edges[(src_key, dst_key, "CDG", e["var"])] = (src_info, dst_info)
-        elif e["type"] == "REACHES":
+    for e in cpg.es.select(type_in={"CONTROLS", "CALLS", "REACHES"}):
+        if e["type"] == "REACHES":
             src_key, src_info = get_top_node_info(e.source_vertex)
             dst_key, dst_info = get_top_node_info(e.target_vertex)
             if not src_key or not dst_key or src_key == dst_key:
                 continue
             edges[(src_key, dst_key, "DDG", e["var"])] = (src_info, dst_info)
+        # if e["type"] in {"CONTROLS", "CALLS"}:
+        else:
+            src_key, src_info = get_top_node_info(e.source_vertex)
+            dst_key, dst_info = get_top_node_info(e.target_vertex)
+            if not src_key or not dst_key or src_key == dst_key:
+                continue
+            edges[(src_key, dst_key, "CDG", e["var"])] = (src_info, dst_info)
 
     line_pdg = Graph(directed=True)
     vs = []
@@ -522,12 +530,11 @@ def joern_parse(src):
     shutil.rmtree(dst, ignore_errors=True)
 
     sp.call(
-        " ".join(["./joern-parse", "-outdir", dst, "-outformat", "csv", src]),
+        " ".join([JOERN_PARSE_BIN, "-outdir", dst, "-outformat", "csv", src]),
         shell=True,
-        cwd="./octopus-joern/",
     )
 
-    sp.call("../octopus-joern-merge.sh", shell=True, cwd=dst)
+    sp.call(MERGE_SCRIPT, shell=True, cwd=dst)
 
     node_file = dst + "/nodes.csv"
     edge_file = dst + "/edges.csv"
@@ -535,14 +542,41 @@ def joern_parse(src):
     return node_file, edge_file
 
 
-def get_slice_poi(cpg):
+def select_children_by_etype(
+    v,
+    etype={"IS_AST_PARENT", "IS_FUNCTION_OF_AST", "IS_FILE_OF", "IS_FUNCTION_OF_CFG"},
+):
+    if isinstance(etype, str):
+        etype = frozenset([etype])
+
+    res = []
+    for edge in v.out_edges():
+        if edge["type"] in etype:
+            res.append(edge.target_vertex)
+    return res
+
+
+def get_function_vertexs(funcv: Vertex) -> set[int]:
+    funcvset = set()
+    queue = [funcv]
+    while queue:
+        top = queue.pop(0)
+        if top.index in funcvset:
+            continue
+        funcvset.add(top.index)
+        for child in select_children_by_etype(top):
+            queue.append(child)
+    return funcvset
+
+
+def get_slice_poi(vscope: list[Vertex]) -> set[int]:
     """slice point of interest"""
     calls = set[int]()
     array_indexings = set[int]()
     ptr_member_accesses = set[int]()
     arithmatics = set[int]()
 
-    for v in cpg.vs:
+    for v in vscope:
         ntype = v["type"].strip()
         if ntype == "CallExpression":
             calleev = v.graph.vs[v.index + 1]
@@ -657,8 +691,21 @@ def clean_slice(slice_code):
     return cleaned_slice
 
 
+def extract_graphs(project_dir):
+    node_file, edge_file = joern_parse(project_dir)
+
+    cpg = load_graph(node_file, edge_file)
+
+    func_table = get_functions(cpg)
+    add_call_edges(cpg, func_table)
+
+    linepdg = merge_nodes(cpg)
+
+    return cpg, linepdg
+
+
 if __name__ == "__main__":
-    src = "/home/frezcirno/src/joern_slicer/test_project/"
+    src = "/home/frezcirno/src/joern_slicer/test_project2/"
     cpg_dst = src.rstrip("/") + "_cpg.picklez"
     line_pdg_dst = src.rstrip("/") + "_line_pdg.picklez"
 
@@ -686,11 +733,11 @@ if __name__ == "__main__":
     plot_dot(cpg, src.rstrip("/") + "_cpg.dot", render=True)
     plot_dot(line_pdg, src.rstrip("/") + "_line_pdg.dot", render=True)
 
-    slice_points = get_slice_poi(cpg)
+    slice_pois = get_slice_poi(cpg.vs)
 
     slice_dataset = []
-    for slice_point in slice_points:
-        slice_pointv = cpg.vs[slice_point]
+    for slice_poi in slice_pois:
+        slice_pointv = cpg.vs[slice_poi]
 
         loc, info = get_top_node_info(slice_pointv)
         linepdg_pointv = line_pdg.vs.find(name=loc)
